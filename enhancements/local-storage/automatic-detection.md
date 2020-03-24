@@ -18,11 +18,11 @@ approvers:
   - "@hekumar"
   - "@chuffman"
 creation-date: 2020-01-21
-last-updated: 2020-03-17
+last-updated: 2020-03-25
 status: implementable
 ---
 
-# Automatic detection of Disks in Local-Storage-Operator 
+# Automatic detection of Disks in the Local-Storage-Operator
 
 ## Release Signoff Checklist
 
@@ -34,8 +34,9 @@ status: implementable
 
 ## Summary
 
-This is a proposal to enable 
-- automated provisioning of LocalPVs sorting them into StorageClasses based on their characteristics via the `LocalVolumeGroup` CRD. 
+This is a proposal to enable
+- automated discovery of local disks via the `LocalVolumeDiscovery` CR and exposing the result via `LocalVolumeDiscoveryResult` CR.
+- automated provisioning of LocalPVs sorting them into StorageClasses based on their characteristics via the `LocalVolumeSet` CRD.
 
 This CRD will be implemented in the LocalStorageOperator(LSO)
 
@@ -64,40 +65,208 @@ and we can use that information to sort devices into storage classes based on th
   - has no child partitions.
   - has no FS signature.
   - state (as outputted by `lsblk`) is not `suspended`
-- There is a risk that LSO will detect just attached device as empty, before kubelet formats it, we mitigate this risk 
+- There is a risk that LSO will detect just attached device as empty, before kubelet formats it, we mitigate this risk
     - by re-checking the device after ~1 minute.
 - There is a risk that the path of the disk changes after reboot and disk can be re-detected as new, we mitigate this risk by
     - Using disk id for symlink.
 - There is a risk that LSO will match all local disks that already have PVs, but these PVs are not bound / used yet.`
     - We leave it up to the cluster admin for selecting the inclusion spec.
-- There is a risk that multiple `LocalVolumeGroup` and `LocalVolume` CRs will use the same device.
+- There is a risk that multiple `LocalVolumeSet` and `LocalVolume` CRs will use the same device.
     - We leave it up to the cluster admin to adjust the CR.
+- There is a risk that LSO may create PV for a device/disk that's already used as another PV.
+    - We can solve this by updating local-storage-static-provisioner to hash localPVs using hostname and disk name and remove the storageclass.
 
 ## Proposal
 
-The `local-storage-operator` is already capable of consuming local disks from the nodes and provisioning PVs out of them,
-but the disk/device paths needs to explicitly specified in the `LocalVolume` CR.
-The idea is to introduce a new feature in LSO
+The `local-storage-operator` is already capable of consuming local disks from the nodes and provisioning PVs out of them, but the disk/device paths needs to explicitly specified in the `LocalVolume` CR.
+The idea is to introduce two new features in LSO
+  - Auto discovery of local devices
+    - This will introduce two new CRs `LocalVolumeDiscovery` and `LocalVolumeDiscoveryResult`.
+    - The purpose of this will be to expose local devices available in a node via the `LocalVolumeDiscoveryResult` CR.
+    - The device discovery will be done once via a daemonSet pod.
   - Auto provisioning of localDevices
-    - This will involve introduction of a new CR called `LocalVolumeGroup`.
-    - The pupose of this will be to auto discover and provision PVs on devices which match the inclusion filter present in the CR.
+    - This will introduce a new CR called `LocalVolumeSet`.
+    - The purpose of this will be to auto discover and provision PVs on devices which match the inclusion filter present in the CR.
     - This will involve a continous process of discovery of devices via the diskmaker daemons. Any discovered devices which matches the inclusion filter will be considered for provisioning of PVs.
 
-## Design Details for `Auto provisioning of local devices`
-API scheme for `LocalVolumeGroups`:
+Once we have the detected devices the administrator can create the localPVs by explicitly selecting the disks. This can be done by the `localVolume` CR. The other option would be to create localPVs via the `LocalVolumeSet` CR and passing the inclusion filters in it.
+
+#### Workflow of LocalPV creation via LocalVolume CR
+
+1. Discovery: The user can choose to run discovery if they want to understand what devices are available across the nodes in the cluster.
+    - ##### NOTE: This step is optional for users directly creating CRs. They might already know what CRs they need for step 2.
+2. PV Creation: After the user has decided how to created PVs, they can choose to create PVs with either the `LocalVolume` CR or the `LocalVolumeSet` CR.
+
+## Design Details for `Auto discovery of local devices`
+
+API scheme for `LocalVolumeDiscovery` and `LocalVolumeDiscoveryResult` CR:
 
 ```go
-type LocalVolumeGroupList struct {
+type LocalVolumeDiscoveryList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata"`
-	Items           []LocalVolumeGroup `json:"items"`
+	Items           []LocalVolumeDiscovery `json:"items"`
 }
 
-type LocalVolumeGroup struct {
+type LocalVolumeDiscovery struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata"`
-	Spec              LocalVolumeGroupSpec   `json:"spec"`
-	Status            LocalVolumeGroupStatus `json:"status,omitempty"`
+	Spec              LocalVolumeDiscoverySpec   `json:"spec"`
+	Status            LocalVolumeDiscoveryStatus `json:"status,omitempty"`
+}
+
+type LocalVolumeDiscoverySpec struct {
+	// Nodes on which the automatic detection policies must run.
+	// +optional
+	NodeSelector *corev1.NodeSelector `json:"nodeSelector,omitempty"`
+	// If specified tolerations is the list of toleration that is passed to the
+	// LocalVolumeDiscovery Daemon
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+}
+
+type LocalVolumeDiscoveryStatus struct {
+	// Conditions is a list of conditions and their status.
+	Conditions []operatorv1.OperatorCondition `json:"conditions,omitempty"`
+	// observedGeneration is the last generation change the operator has dealt with
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+}
+
+type LocalVolumeDiscoveryResultList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+	Items           []LocalVolumeDiscoveryResult `json:"items"`
+}
+
+type LocalVolumeDiscoveryResult struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata"`
+	Spec              LocalVolumeDiscoveryResultSpec   `json:"spec"`
+	Status            LocalVolumeDiscoveryResultStatus `json:"status,omitempty"`
+}
+
+type LocalVolumeDiscoveryResultSpec struct {
+	NodeName string `json:"nodeName"`
+}
+
+type LocalVolumeDiscoveryResultStatus struct {
+	// Conditions is a list of conditions and their status.
+	Conditions          []operatorv1.OperatorCondition `json:"conditions,omitempty"`
+	DiscoveredTimeStamp string                         `json:"discoveredTimeStamp,omitempty"`
+	// Devices contains the list of devices on which LSO
+	// is capable of creating LocalPVs
+	// The devices in this list qualify these following conditions.
+	// - it should be a non-removable device.
+	// - it should not be a read-only device.
+	// - it should not be mounted anywhere
+	// - it should not be a boot device
+	// - it should not have child partition in lsblk output
+	Devices []Device `json:"devices"`
+}
+
+type Device struct {
+	// Name of the detected device
+	Name string `json:"name"`
+	// Model of the detected device
+	Model string `json:"model,omitempty"`
+	// Type of the detected device
+	Type string `json:"type,omitempty"`
+	// Vendor of the detected device
+	Vendor string `json:"vendor,omitempty"`
+	// Size of the detected device
+	Size resource.Quantity `json:"size,omitempty"`
+	// Rotational represents whether the device type is rotational or not
+	Rotational bool `json:"rotational,omitempty"`
+    // FSType represents the filesystem available on the device
+	FSType string `json:"fstype",omitempty`
+}
+```
+
+### Workflow of `Auto Device Discovery`
+The discovery of local devices will be done by the `LocalVolumeDiscovery` and `LocalVolumeDiscoveryResult` CR.
+#### LocalVolumeDiscovery CR
+- Once the `LocalVolumeDiscovery` CR is deployed, its controller will:
+  - Create a daemonSet to run on each of the valid nodes.(Information about the valid list of nodes would be available in the `LocalVolumeDiscovery` CR as `nodeSelector`)
+  - Remember the current timestamp when the discovery has been triggered.
+- The DaemonSet pod running on each valid node will:
+  - Identify the list of devices available on that node.
+  - Create`LocalVolumeDiscoveryResult` CR on that node with the list of devices identified above.
+- The operator would delete the daemonSet if:
+  - `LocalVolumeDiscoveryResult` is created on the node where daemonSet pod is running.
+  - The last updated timestamp on the `LocalVolumeDiscoveryResult` CR is greater than discovery start timestamp.
+- The operator would delete the daemonSet in a retry logic that runs after every fixed interval of time.
+
+Example of `LocalVolumeDiscovery` CR:
+```yaml
+apiVersion: local.storage.openshift.io/v1alpha1
+kind: LocalVolumeDiscovery
+metadata:
+  name: example-autodetect
+  namespace: localStorage
+spec:
+  nodeSelector:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+              - worker-0
+              - worker-1
+status:
+  conditions:
+  - lastTransitionTime: "2020-03-17T09:33:43Z"
+    status: "True"
+    type: Available
+```
+
+#### LocalVolumeDiscoveryResult CR
+- The `LocalVolumeDiscoveryResult` CR will be exposing the available local devices of the node in its status.
+- These information will mostly be the output of  `lsblk -o name,model,vendor,kname,pkname,fstype,type,uuid,tran,ro,rm,parttype,serial,size,rota,mountpoint`.
+
+Example of `LocalVolumeDiscoveryResult` CR after detection:
+```yaml
+apiVersion: local.storage.openshift.io/v1alpha1
+kind: LocalVolumeDiscoveryResult
+metadata:
+  name: example-volume-detect-1
+  namespace: localStorage
+spec:
+  nodeName: worker-0
+status:
+  conditions:
+  - lastTransitionTime: "2020-03-17T09:33:43Z"
+    status: "True"
+    type: Available
+  discoveredTimeStamp: '2020-03-09T08:37:19Z'
+  devices:
+    - name: sda
+      model: SAMSUNG MZ7LN512
+      vendor: ATA
+      type: disk
+      size: 477G
+      rotational: true
+```
+### Cadence for `Auto Device Discovery`
+- Running device discovery continuously will be expensive. It should be a one time thing, that is, don't allow this operation to be performed multiple times even from the UI.
+- If the user has selected wrong set of nodes or wants to change the selected nodes, then they can cancel out of the operation. In this case the device Discovery CRs will be deleted and we can start the operation again with the new device discovery CR.
+- This can be achieved by making an `update` event on the `LocalVolumeDiscovery` CR as a `no-op`
+
+## Design Details for `Auto provisioning of local devices`
+API scheme for `LocalVolumeSets`:
+
+```go
+type LocalVolumeSetList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+	Items           []LocalVolumeSet `json:"items"`
+}
+
+type LocalVolumeSet struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata"`
+	Spec              LocalVolumeSetSpec   `json:"spec"`
+	Status            LocalVolumeSetStatus `json:"status,omitempty"`
 }
 
 // PersistentVolumeMode describes how a volume is intended to be consumed, either Block or Filesystem.
@@ -110,7 +279,7 @@ const (
 	PersistentVolumeFilesystem PersistentVolumeMode = "Filesystem"
 )
 
-type LocalVolumeGroupSpec struct {
+type LocalVolumeSetSpec struct {
 	// Nodes on which the automatic detection policies must run.
 	// +optional
 	NodeSelector *corev1.NodeSelector `json:"nodeSelector,omitempty"`
@@ -154,8 +323,8 @@ type DeviceType string
 const (
 	// The DeviceTypes that will be supported by the LSO.
 	// These Discovery policies will based on lsblk's type output
-	// Disk represents a device-type of disk
-	Disk DeviceType = "Disk"
+	// RawDisk represents a device-type of block disk
+	RawDisk DeviceType = "RawDisk"
 	// Part represents a device-type of partion
 	Partition DeviceType = "Partition"
 )
@@ -190,7 +359,7 @@ type DeviceInclusionSpec struct {
 	Vendors []string `json:"vendors"`
 }
 
-type LocalVolumeGroupStatus struct {
+type LocalVolumeSetStatus struct {
 	// Conditions is a list of conditions and their status.
 	Conditions []operatorv1.OperatorCondition `json:"conditions,omitempty"`
 
@@ -202,21 +371,22 @@ type LocalVolumeGroupStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 ```
-### Workflow of LocalPV creation via LocalVolumeGroup CR
-- Once the `LocalVolumeGroup` is created, the controller will:
+### Workflow of `LocalPV` creation via `LocalVolumeSet CR`
+- Once the `LocalVolumeSet` is created, the controller will:
   - configure the local-static-provisioner to make a new StorageClass based on certain directories on the selected nodes.
-  - assign diskmaker daemons to the selected nodes.
+  - assign diskmaker daemonset to the selected nodes.
+  - there will be one daemonset for each `LocalVolumeSet` CR.
 - The diskmaker daemon will find devices that match the disovery policy and symlink them into the directory that the local-static-provisioner is watching.
 
-#### Note: There is a chance of race condition and duplicate creation of PVs 
-- If two `LocalVolumeGroup` CR targets same nodes with overlapping inclusion filter.
-- If `LocalVolumeGroup` CR and `LocalVolume` CR targets the same node with overlapping devices.
-  
-Example of `LocalVolumeGroup` CR:
+#### Note: There is a chance of race condition and duplicate creation of PVs
+- If two `LocalVolumeSet` CR targets same nodes with overlapping inclusion filter.
+- If `LocalVolumeSet` CR and `LocalVolume` CR targets the same node with overlapping devices.
+
+Example of `LocalVolumeSet` CR:
 
 ```yaml
 apiVersion: local.storage.openshift.io/v1alpha1
-kind: LocalVolumeGroup
+kind: LocalVolumeSet
 metadata:
   name: example-autodetect
 spec:
@@ -234,8 +404,8 @@ spec:
   maxDeviceCount: 10
   deviceInclusionSpec:
     deviceTypes:
-      - Disk
-    deviceMechanicalProperty: 
+      - RawDisk
+    deviceMechanicalProperty:
       - Rotational
       - NonRotational
     minSize: 10G
@@ -250,7 +420,7 @@ status:
 
 ```yaml
 apiVersion: local.storage.openshift.io/v1alpha1
-kind: LocalVolumeGroup
+kind: LocalVolumeSet
 metadata:
   name: example-autodetect
 spec:
@@ -269,9 +439,9 @@ spec:
   maxDeviceCount: 10
   deviceInclusionSpec:
     deviceTypes:
-      - Disk
+      - RawDisk
       - Partition
-    deviceMechanicalProperty: 
+    deviceMechanicalProperty:
       - NonRotational
     minSize: 10G
     maxSize: 100G
@@ -325,5 +495,4 @@ N/A
 - Existing manual creation of LocalVolume CRs. With the node selector on the LocalVolume, a single CR can apply to an entire class of nodes (i.e., a machineset or a physical rack of homogeneous hardware). When a machineset is defined, a corresponding LocalVolume can also be created.
 - Directly enhancing the LocalVolume CR to allow for auto discovery
 
-The first approach requires some manual work and knowledge of underlying nodes, this makes it inefficient for large clusters. The second approach can introduce breaking change to the existing GA API.
-Therefore this approach makes sense.
+The first approach requires some manual work and knowledge of underlying nodes, this makes it inefficient for large clusters. The second approach can introduce breaking change to the existing GA API. Therefore this approach makes sense.
